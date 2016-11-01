@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"flag"
 	"fmt"
 	"io"
@@ -36,12 +37,27 @@ type Service struct {
 	Handler func(s Service, w http.ResponseWriter, r *http.Request)
 }
 
+// ParseURLNamedParams parse the request into named parameters
+func (s *Service) ParseURLNamedParams(r *http.Request) map[string]string {
+	namedParams := make(map[string]string)
+
+	subexpNames := s.Pattern.SubexpNames()
+	matches := s.Pattern.FindAllStringSubmatch(r.URL.Path, -1)[0]
+
+	for i, match := range matches {
+		if name := subexpNames[i]; name != "" {
+			namedParams[name] = match
+		}
+	}
+	return namedParams
+}
+
 // GitSmartHTTPConfig is the configuration for GitSmartHTTP
 type GitSmartHTTPConfig struct {
-	RepoPath    string
-	ReceivePack bool
-	UploadPack  bool
-	Port        int
+	ReposRootPath string
+	ReceivePack   bool
+	UploadPack    bool
+	Port          int
 }
 
 // GitSmartHTTP acts as an Git Smart HTTP server's handler and deal
@@ -100,12 +116,12 @@ func NewGitSmartHTTP(cfg *GitSmartHTTPConfig) GitSmartHTTP {
 		},
 		Service{
 			Method:  "POST",
-			Pattern: regexp.MustCompile("(?P<repoPath>.*)/git-upload-pack$"),
+			Pattern: regexp.MustCompile("(?P<repoPath>.*)/(?P<serviceType>git-upload-pack)$"),
 			Handler: gsh.handleServiceRPC,
 		},
 		Service{
 			Method:  "POST",
-			Pattern: regexp.MustCompile("(?P<repoPath>.*)/git-receive-pack$"),
+			Pattern: regexp.MustCompile("(?P<repoPath>.*)/(?P<serviceType>git-receive-pack)$"),
 			Handler: gsh.handleServiceRPC,
 		},
 	}
@@ -154,7 +170,8 @@ func (gsh GitSmartHTTP) handleInfoRefs(s Service, w http.ResponseWriter, r *http
 
 	serviceType := r.FormValue("service")
 
-	repoPath := path.Join(gsh.RepoPath, s.Pattern.FindAllStringSubmatch(r.URL.Path, -1)[0][1])
+	namedURLParams := s.ParseURLNamedParams(r)
+	repoPath := path.Join(gsh.ReposRootPath, namedURLParams["repoPath"])
 
 	gs := NewGitRPCClient(&GitRPCClientConfig{
 		Stream: false,
@@ -188,38 +205,56 @@ func (gsh GitSmartHTTP) handleInfoRefs(s Service, w http.ResponseWriter, r *http
 }
 
 func (gsh GitSmartHTTP) handleServiceRPC(s Service, w http.ResponseWriter, r *http.Request) {
-	fullPath := r.URL.Path
+	defer r.Body.Close()
 
-	repo := s.Pattern.FindAllStringSubmatch(fullPath, -1)[0][1]
-	repoPath := path.Join(gsh.RepoPath, repo)
-	rpc := fullPath[len(repo)+1 : len(fullPath)]
+	namedURLParams := s.ParseURLNamedParams(r)
 
-	if !gsh.serviceAccess(rpc) {
+	repoPath := path.Join(gsh.ReposRootPath, namedURLParams["repoPath"])
+	serviceType := namedURLParams["serviceType"]
+
+	if !gsh.serviceAccess(serviceType) {
 		w.WriteHeader(http.StatusForbidden)
 		w.Header().Set("Content-Type", "text/plain")
 		return
 	}
 
-	reqBody, _ := ioutil.ReadAll(r.Body)
+	var reqBody []byte
+
+	switch r.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err := gzip.NewReader(r.Body)
+		if err != nil {
+			log.Printf("Cannot parse request body with: %s", err)
+		}
+		defer reader.Close()
+		reqBody, _ = ioutil.ReadAll(reader)
+	default:
+		reqBody, _ = ioutil.ReadAll(r.Body)
+	}
 
 	gs := NewGitRPCClient(&GitRPCClientConfig{
 		Stream: true,
 	})
-	if rpc == uploadPack {
+
+	if serviceType == uploadPack {
 		gs.UploadPack(repoPath, map[string]struct{}{})
 	} else {
 		gs.ReceivePack(repoPath, map[string]struct{}{})
 	}
 
-	w.Header().Set("Content-Type", fmt.Sprintf("application/x-git-%s-result", rpc))
+	w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-result", serviceType))
+
 	if err := gs.Start(); err != nil {
-		fmt.Println("error!")
+		log.Printf("Git RPC call %s cannot be started successfully: %s", serviceType, err)
 	}
+
 	gs.StdinWriter.Write(reqBody)
 	io.Copy(w, gs.StdoutReader)
 	io.Copy(w, gs.StderrReader)
 
-	gs.Wait()
+	if err := gs.Wait(); err != nil {
+		log.Printf("Git RPC call %s cannot be stopped properly: %s", serviceType, err)
+	}
 }
 
 func pktWrite(s string) string {
@@ -233,7 +268,7 @@ func pktFlush() string {
 }
 
 func (gsh GitSmartHTTP) sendFile(w http.ResponseWriter, r *http.Request, contentType string, hdr map[string]string) {
-	fullPath := path.Join(gsh.RepoPath, r.URL.Path)
+	fullPath := path.Join(gsh.ReposRootPath, r.URL.Path)
 
 	f, err := os.Open(fullPath)
 	if err != nil {
@@ -310,7 +345,7 @@ func main() {
 	var vsn bool
 	gsc := GitSmartHTTPConfig{}
 	flag.BoolVar(&vsn, "version", false, "print version")
-	flag.StringVar(&gsc.RepoPath, "repo-path", "/etc/git-http-backend", "directory that contains git repositories you want to serve")
+	flag.StringVar(&gsc.ReposRootPath, "repo-path", "/etc/git-http-backend", "directory that contains git repositories you want to serve")
 	flag.BoolVar(&gsc.ReceivePack, receivePack, true, "whether you want to receive what is pushed into repository")
 	flag.BoolVar(&gsc.UploadPack, uploadPack, true, "whether you want to send objects packed back to git-fetch-pack")
 	flag.IntVar(&gsc.Port, "port", 8080, "port that the Git server backend runs on")
