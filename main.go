@@ -15,18 +15,24 @@ import (
 	"time"
 )
 
+// VERSION is the version of the binary
+var VERSION string
+
+// COMMIT is current commit SHA number
+var COMMIT string
+
 const (
-	version     = "0.0.1"
 	uploadPack  = "git-upload-pack"
 	receivePack = "git-receive-pack"
-	banner      = `
+	//BANNER shows at the beginning of the command line
+	BANNER = `
        _ _     _   _   _          _             _               _
   __ _(_) |_  | |_| |_| |_ _ __  | |__  __ _ __| |_____ _ _  __| |
  / _` + "` " + `| |  _| | ' \  _|  _| '_ \ | '_ \/ _` + "` " + `/ _| / / -_) ' \/ _` + "`" + ` |
  \__, |_|\__| |_||_\__|\__| .__/ |_.__/\__,_\__|_\_\___|_||_\__,_|
  |___/                    |_|
   Git HTTP Backend
-    Version: %s
+    Version: %s Build: %s
 `
 )
 
@@ -225,6 +231,8 @@ func (gsh GitSmartHTTP) handleServiceRPC(s Service, w http.ResponseWriter, r *ht
 		reader, err := gzip.NewReader(r.Body)
 		if err != nil {
 			log.Printf("Cannot parse request body with: %s", err)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
 		}
 		defer reader.Close()
 		reqBody, _ = ioutil.ReadAll(reader)
@@ -341,31 +349,49 @@ func setHeaders(w http.ResponseWriter, hdr map[string]string) {
 	}
 }
 
-func main() {
+var gsh GitSmartHTTP
+
+func init() {
 	var vsn bool
 	gsc := GitSmartHTTPConfig{}
+
 	flag.BoolVar(&vsn, "version", false, "print version")
-	flag.StringVar(&gsc.ReposRootPath, "repo-path", "/etc/git-http-backend", "directory that contains git repositories you want to serve")
-	flag.BoolVar(&gsc.ReceivePack, receivePack, true, "whether you want to receive what is pushed into repository")
-	flag.BoolVar(&gsc.UploadPack, uploadPack, true, "whether you want to send objects packed back to git-fetch-pack")
+	flag.StringVar(&gsc.ReposRootPath, "repos-root-path", "/etc/git-http-backend", "directory that contains git repositories to serve")
+	flag.BoolVar(&gsc.ReceivePack, receivePack, true, "whether to receive what is pushed into repository")
+	flag.BoolVar(&gsc.UploadPack, uploadPack, true, "whether to send objects packed back to git-fetch-pack")
 	flag.IntVar(&gsc.Port, "port", 8080, "port that the Git server backend runs on")
+
 	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, fmt.Sprintf(banner, version))
+		fmt.Fprint(os.Stderr, fmt.Sprintf(BANNER, VERSION, COMMIT))
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
 
 	if vsn {
-		fmt.Printf("git-http-backend version: %s\n", version)
+		fmt.Printf("git-http-backend version: %s, commit: %s\n", VERSION, COMMIT)
 		os.Exit(0)
 	}
 
-	gsh := NewGitSmartHTTP(&gsc)
+	if flag.NArg() >= 1 {
+		switch flag.Args()[0] {
+		case "version":
+			fmt.Printf("git-http-backend version: %s, commit: %s\n", VERSION, COMMIT)
+			os.Exit(0)
+		case "help":
+			flag.Usage()
+			os.Exit(0)
+		}
+	}
+
+	gsh = NewGitSmartHTTP(&gsc)
+}
+
+func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", gsh)
 	port := fmt.Sprintf(":%d", gsh.Port)
-	log.Printf(banner+"    Running on port %d", version, gsh.Port)
+	log.Printf(BANNER+"    Running on port %d", VERSION, COMMIT, gsh.Port)
 	http.ListenAndServe(port, mux)
 }
